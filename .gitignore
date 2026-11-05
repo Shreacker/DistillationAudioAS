@@ -1,0 +1,12 @@
+# Environment
+.venv/
+.env/
+__pycache__/
+
+# Data
+data/
+checkpoints/
+test.*
+
+# Teacher model
+AASIST/
