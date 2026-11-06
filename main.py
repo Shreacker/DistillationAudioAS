@@ -95,7 +95,7 @@ def main(args: argparse.Namespace) -> None:
         print(f'Start training epoch {epoch:03d}')
         if current_index < len(teacher_chkps) - 1:
             current_index = min(
-                GS(s, teacher_chkps, current_index, val_dl, threshold, divergence_metric)
+                GS(s, teacher, teacher_chkps, current_index, val_dl, threshold, divergence_metric)
                 for s in students
             )
             teacher.load_state_dict(torch.load(teacher_chkps[current_index], map_location=device))
@@ -103,6 +103,7 @@ def main(args: argparse.Namespace) -> None:
         print(f'Teacher checkpoint index: {current_index}')
         phase = min(n_phase - 1, current_index * n_phase // len(teacher_chkps))
         epoch_losses = []
+        
         for i, (s, m) in enumerate(zip(model_config.keys(), students)):
             oc = optim_config[s]
             hp = dict(

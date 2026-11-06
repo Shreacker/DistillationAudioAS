@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from torch.nn import functional as F
 from importlib import import_module
 
 from data_utils.ASVspoof2019 import Dataset_ASVspoof2019_train, Dataset_ASVspoof2019_devNeval, genSpoof_list
@@ -22,6 +23,34 @@ def cosine_annealing(step, total_steps, lr_max, lr_min):
 
 def keras_decay(step, decay=0.0001):
     return 1. / (1. + decay*step)
+
+def kl_div(log_p, log_q, dim=1):
+    return (log_p.exp() * (log_p - log_q)).sum(dim=dim)
+
+def js_div(log_p, log_q):
+    log_m = torch.logsumexp(torch.stack([log_p, log_q]), dim=0) - torch.log(torch.tensor(2.0))
+    
+    return 0.5 * kl_div(log_p, log_m) + 0.5 * kl_div(log_q, log_m)
+
+@torch.no_grad()
+def divergence_metric(metric, P, Q, dev_loader, device='cpu'):
+    p_mode, q_mode = P.training, Q.training
+    P.eval()
+    Q.eval()
+
+    total_div, n = 0., 0
+    for item in dev_loader:
+        # Check key name
+        X = item['data'].to(device).flatten(1)
+        log_p = F.log_softmax(P(X), dim=1)
+        log_q = F.log_softmax(Q(X), dim=1)
+        div = metric(log_p, log_q)
+        total_div += div.sum().item()
+        n += X.size(0)
+
+    P.train(p_mode)
+    Q.train(q_mode)
+    return total_div / n
 
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
@@ -186,3 +215,36 @@ def create_optimizer(model_parameters, optim_config):
     scheduler = _get_scheduler(optimizer, optim_config)
     
     return optimizer, scheduler
+
+def GS(
+        student_model: torch.nn.Module,
+        teacher_model: torch.nn.Module,
+        teacher_checkpoints: list,
+        current_idx: int=-1,
+        dev_dl: DataLoader=None,
+        threshold: float=0.8,
+        metric=None,
+        eps: float=1e-12,
+        device='cpu'
+):
+    student_model.eval()
+
+    j = current_idx + 1
+    n_anchors = len(teacher_checkpoints)
+
+    def anchor2metric(idx):
+        if idx >= 0:
+            anchor = torch.load(teacher_checkpoints[idx], map_location=device, weights_only=True)
+            teacher_model.load_state_dict(anchor)
+        
+        return divergence_metric(metric, student_model, teacher_model, dev_dl, device=device)
+
+    h_i = anchor2metric(current_idx)
+
+    while j < n_anchors:
+        h_j = anchor2metric(j)
+        r_ij = (h_j - h_i) / h_i
+        if r_ij > threshold:
+            return j - 1
+
+    return n_anchors - 1
