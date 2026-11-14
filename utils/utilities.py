@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from torch.nn import functional as F
 from importlib import import_module
 
-from data_utils.ASVspoof2019 import Dataset_ASVspoof2019_train, Dataset_ASVspoof2019_devNeval, genSpoof_list
+from data_utils.ASVspoof2019 import Dataset_ASVspoof2019_train, Dataset_ASVspoof2019_devNeval, genSpoof_list, select_files
 from utils.sam import SAM
 
 def str_to_bool(val):
@@ -99,17 +99,45 @@ def get_loader(
         "ASVspoof2019_{}_cm_protocols/{}.cm.eval.trl.txt".format(
             track, prefix_2019))
 
-    d_label_trn, file_train = genSpoof_list(dir_meta=trn_list_path,
+    d_label_trn, file_train, d_attack_trn = genSpoof_list(dir_meta=trn_list_path,
                                             is_train=True,
                                             is_eval=False)
     print("no. training files:", len(file_train))
 
-    train_set = Dataset_ASVspoof2019_train(list_IDs=file_train,
+    sub_sets, subset_info = select_files(d_label_trn, d_attack_trn, seed=42, tts_percents=(30, 50, 70))
+
+    train_set_30tts = Dataset_ASVspoof2019_train(list_IDs=sub_sets["tts30_vc70"],
                                            labels=d_label_trn,
                                            base_dir=trn_database_path)
+    
+    train_set_50tts = Dataset_ASVspoof2019_train(list_IDs=sub_sets["tts50_vc50"],
+                                           labels=d_label_trn,
+                                           base_dir=trn_database_path)
+    
+    train_set_70tts = Dataset_ASVspoof2019_train(list_IDs=sub_sets["tts70_vc30"],
+                                           labels=d_label_trn,
+                                           base_dir=trn_database_path)
+    
     gen = torch.Generator()
     gen.manual_seed(seed)
-    trn_loader = DataLoader(train_set,
+
+    trn_loader_30tts = DataLoader(train_set_30tts,
+                            batch_size=config["batch_size"],
+                            shuffle=True,
+                            drop_last=True,
+                            pin_memory=True,
+                            worker_init_fn=seed_worker,
+                            generator=gen)
+    
+    trn_loader_50tts = DataLoader(train_set_50tts,
+                            batch_size=config["batch_size"],
+                            shuffle=True,
+                            drop_last=True,
+                            pin_memory=True,
+                            worker_init_fn=seed_worker,
+                            generator=gen)
+    
+    trn_loader_70tts = DataLoader(train_set_70tts,
                             batch_size=config["batch_size"],
                             shuffle=True,
                             drop_last=True,
@@ -141,7 +169,7 @@ def get_loader(
                              drop_last=False,
                              pin_memory=True)
 
-    return trn_loader, dev_loader, eval_loader
+    return trn_loader_30tts, trn_loader_50tts, trn_loader_70tts, dev_loader, eval_loader
 
 def _get_optimizer(model_parameters, optim_config):
     optimizer_name = optim_config['optimizer']
