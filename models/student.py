@@ -190,7 +190,7 @@ class Student(nn.Module):
 
     def forward(self, x: torch.Tensor):
         if x.dim() == 3: x = x.unsqueeze(1)
-
+        # Encoder
         feat = self.blocks(x) # (B, C, M, N)
         feat = self.avg_pooling(feat).flatten(1) # (B, CxMxN)
         logits = self.fc(feat) # (B, 2)
