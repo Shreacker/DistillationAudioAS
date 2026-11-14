@@ -10,3 +10,6 @@ test.*
 
 # Teacher model
 AASIST/
+
+# Others
+CLAUDE.md
