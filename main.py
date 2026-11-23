@@ -8,16 +8,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
-from torch import nn, optim
+from torch import nn
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import f1_score, accuracy_score
 from tqdm import tqdm
 from pathlib import Path
 from shutil import copy
 from natsort import natsorted
 
 from utils.loss_fn import ClassroomCache, ClassroomLoss
-from utils.sam import SAM
 from utils.ga import EnsembleWeightGA
 from utils.evaluation import calculate_tDCF_EER
 from utils.utilities import str_to_bool, set_seed, get_model, get_loader, create_optimizer, GS
@@ -37,19 +35,18 @@ def main(args: argparse.Namespace) -> None:
 
     model_config = {}
     optim_config = {}
-    track = {}
-    for i in range(len(config) - 1):
+    track = config['track']
+    assert track in ['LA', 'PA', 'DF'], 'Invalid track given'
+    for i in range(5):
         s = f'student{i+1}'
         model_config[s] = config[s]['model_config']
         optim_config[s] = config[s]['optim_config']
-        optim_config[s]['epochs'] = config[s]['num_epochs']
-        track[s] = config[s]['track']
-        assert track[s] in ['LA-TTS', 'LA-VC', 'LA-Both'], "Invalid track given to Student model."
+        optim_config[s]['epochs'] = config['num_epochs']
 
     set_seed(args.seed)
 
     output_dir = Path(args.output_dir)
-    database_path = Path(config['student1']['database_path'])
+    database_path = Path(config['database_path'])
     teacher_chkps_path = Path(config['teacher']['checkpoints_path'])
     prefix_la_2019 = f'ASVspoof2019.LA'
     dev_trial_path = (database_path /
@@ -70,7 +67,6 @@ def main(args: argparse.Namespace) -> None:
     ens_weight_save_path = model_tag / 'ens_weights'
     eval_score_path = model_tag / config['eval_output']
     writer = SummaryWriter(model_tag)
-    os.makedirs(lambda p: p in [model_tag, model_save_path, ens_weight_save_path, eval_score_path], exist_ok=True)
     for path in [model_tag, model_save_path, ens_weight_save_path, eval_score_path]:
         try:
             os.makedirs(path, exist_ok=True)
@@ -87,10 +83,12 @@ def main(args: argparse.Namespace) -> None:
     print(f'Device: {device}')
 
     # Models and DataLoaders
+    print('--Teacher params count:')
     teacher = get_model(teacher_config['model_config'], 'Teacher', device)
+    print('--Students params count:')
     students = [get_model(model_config[s], 'Student', device) for s in model_config.keys()]
     train_dl, dev_dl, eval_dl = get_loader(
-        database_path, args.seed, config['student1']
+        database_path, args.seed, config
     )
 
     # Evaluates pretrained checkpoints
@@ -109,7 +107,7 @@ def main(args: argparse.Namespace) -> None:
         produce_evaluation_file(eval_dl, students, device,
                                 ens_weight, eval_score_path, eval_trial_path)
         calculate_tDCF_EER(cm_scores_file=eval_score_path,
-                           asv_score_file=database_path / config['asv_score_path'],
+                           asv_score_file=database_path / config['asv_eval_score_path'],
                            output_file=model_tag / 't-DCF_EER.txt')
         print('DONE.')
         sys.exit(0)
@@ -122,7 +120,7 @@ def main(args: argparse.Namespace) -> None:
         optimizers.append(o)
         schedulers.append(sc)
 
-    best_dev_eer = 1.
+    best_dev_eer = 100.
     best_eval_eer = 100.
     best_dev_tdcf = 0.05
     best_eval_tdcf = 1.
@@ -135,7 +133,7 @@ def main(args: argparse.Namespace) -> None:
     val_dl = DataLoader(Subset(train_dl.dataset, range(1000)), batch_size=train_dl.batch_size, shuffle=False)
     current_index = -1
     threshold = config['teacher'].get('threshold', 1.0)
-    divergence_metric = nn.KLDivLoss(reduction='batchmean')
+    divergence_metric = nn.KLDivLoss(reduction='batchmean', log_target=True)
 
     criterion = ClassroomLoss(weight=torch.tensor([0.1, 0.9])).to(device)
     cache = ClassroomCache(len(students), len(train_dl.dataset), n_classes=2)
@@ -145,20 +143,21 @@ def main(args: argparse.Namespace) -> None:
     n_phase = len(optim_config['student1']['alpha'])
 
     # Training
-    for epoch in range(config['student1']['num_epochs']):
-        print(f'Start training epoch {epoch:03d}')
+    for epoch in tqdm(range(config['num_epochs']), desc='Epoch', leave=True, position=0):
+        tqdm.write(f'Start training epoch {epoch:03d}')
         if current_index < len(teacher_chkps) - 1:
             current_index = min(
-                GS(s, teacher, teacher_chkps, current_index, val_dl, threshold, divergence_metric)
+                GS(s, teacher, teacher_chkps, current_index, val_dl, threshold, divergence_metric, device=device)
                 for s in students
             )
             teacher.load_state_dict(torch.load(teacher_chkps[current_index], map_location=device))
             teacher.eval()
-        print(f'Teacher checkpoint index: {current_index}')
+        
+        tqdm.write(f'Teacher checkpoint index: {current_index}')
         phase = min(n_phase - 1, current_index * n_phase // len(teacher_chkps))
         epoch_losses = []
         
-        for i, (s, m) in enumerate(zip(model_config.keys(), students)):
+        for i, (s, m) in enumerate(tqdm(zip(model_config.keys(), students), total=len(students), desc='Students', leave=False, position=1)):
             oc = optim_config[s]
             hp = dict(
                     T=oc['T'],
@@ -181,32 +180,34 @@ def main(args: argparse.Namespace) -> None:
                 labels_all,
                 oc.get('scheduler')
             )
-            epoch_losses.extend(loss_s) # (5,)
+            epoch_losses.append(loss_s) # (5,)
 
         ga = EnsembleWeightGA(n_models=len(students))
-        ens_weight = ga.evolve(cache.probs.numpy(), labels_all.numpy(), generations=50, patience=8)
-        ens_weight_hist.append(copy.deepcopy(ens_weight))
-        ens_loss = np.mean(epoch_losses)
         ###
+        seen = cache.probs.sum(-1).gt(0).all(0)
+        ens_weight = ga.evolve(cache.probs[:, seen].numpy(), labels_all[seen].numpy(), generations=50, patience=8)
+        ens_weight_hist.append(ens_weight.copy())
+        ens_loss = np.mean(epoch_losses)
         produce_evaluation_file(dev_dl, students, device, ens_weight,
                                 metric_path / 'dev_score.txt', dev_trial_path)
         dev_eer, dev_tdcf = calculate_tDCF_EER(
             cm_scores_file=metric_path / 'dev_score.txt',
-            asv_score_file=database_path / config['asv_score_path'],
+            asv_score_file=database_path / config['asv_dev_score_path'],
             output_file=metric_path / f'dev_t-DCF_EER_{epoch:03d}epo.txt',
             printout=False
         )
         torch.save(ens_weight_hist, ens_weight_save_path / f'ensemble-weight-log_{epoch}epo.pt')
-        print(f'ens_Loss: {ens_loss:.4f} | dev_eer: {dev_eer:3f} | dev_tdcf: {dev_tdcf:.5f} | ens_weights: {np.round(ens_weight, 2)}')
+        tqdm.write(f'ens_Loss: {ens_loss:.4f} | dev_eer: {dev_eer:3f} | dev_tdcf: {dev_tdcf:.5f} | ens_weights: {np.round(ens_weight, 2)}')
         writer.add_scalars('loss/students', {s: l for s, l in zip(model_config.keys(), epoch_losses)}, epoch)
-        writer.add_scalar('loss/mean', np.mean(epoch_losses), epoch)
+        writer.add_scalar('loss/mean', ens_loss, epoch)
         writer.add_scalar('dev_eer', dev_eer, epoch)
         writer.add_scalar('dev_tdcf', dev_tdcf, epoch)
 
         # Callback to exit early
         best_dev_tdcf = min(dev_tdcf, best_dev_tdcf)
         if best_dev_eer >= dev_eer:
-            print('Best model found at epoch', epoch)
+            tqdm.write(f'Best model found at epoch {epoch}')
+            best_dev_eer = dev_eer
             for i, s in enumerate(students):
                 torch.save(s.state_dict(),
                            model_save_path / f'student{i+1}_epoch_{epoch}_{dev_eer:03.3f}.pth')
@@ -218,21 +219,22 @@ def main(args: argparse.Namespace) -> None:
                                         ens_weight, eval_score_path, eval_trial_path)
                 eval_eer, eval_tdcf = calculate_tDCF_EER(
                     cm_scores_file=eval_score_path,
-                    asv_score_file=database_path / config['asv_score_path'],
+                    asv_score_file=database_path / config['asv_eval_score_path'],
                     output_file=metric_path / f't-DCF_EER_{epoch:03d}epo.txt'
                 )
 
                 log_text = f'epoch{epoch:03d}, '
                 if eval_eer < best_eval_eer:
-                    log_test += f'best eer, {eval_eer:.4f}%'
+                    log_text += f'best eer, {eval_eer:.4f}%'
                     best_eval_eer = eval_eer
                 if eval_tdcf < best_eval_tdcf:
                     log_text += f'best tdcf, {eval_tdcf:.4f}'
+                    best_eval_tdcf = eval_tdcf
                     for i, s in enumerate(students):
                         torch.save(s.state_dict(),
                                    model_save_path / f'student{i+1}_best.pth')
                 if len(log_text) > 0:
-                    print(log_text)
+                    tqdm.write(log_text)
                     f_log.write(log_text + '\n')
 
         writer.add_scalar('best_dev_eer', best_dev_eer, epoch)
@@ -244,15 +246,14 @@ def main(args: argparse.Namespace) -> None:
                             best_ens_weight, eval_score_path, eval_trial_path)
     eval_eer, eval_tdcf = calculate_tDCF_EER(
         cm_scores_file=eval_score_path,
-        asv_score_file=database_path / config['asv_score_path'],
+        asv_score_file=database_path / config['asv_eval_score_path'],
         output_file=model_tag / 't-DCF_EER.txt'
     )
-    f_log = open(model_tag / 'metric_log.txt', 'a')
     f_log.write('=' * 5 + '\n')
     f_log.write(f'EER: {eval_eer:.3f}, min t-DCF: {eval_tdcf:.5f}')
     f_log.close()
 
-    print(f'Training FINISHED. EER: {best_eval_eer:.3f}, min t-DCF: {best_eval_tdcf:.5f}')
+    print(f'Training FINISHED. EER: {eval_eer:.3f}, min t-DCF: {eval_tdcf:.5f}')
 
 def train_epoch(
         train_dl: DataLoader,
@@ -275,7 +276,8 @@ def train_epoch(
     model.train()
     teacher.eval()
 
-    for batch_x, batch_y, idx in train_dl:
+    pbar = tqdm(train_dl, desc=f'Student {s+1}', leave=False, position=2)
+    for batch_x, batch_y, idx in pbar:
         batch_size = batch_x.size(0)
         num_total += batch_size
         ii += 1
@@ -292,6 +294,7 @@ def train_epoch(
         classroom, peers = cache.get(s, idx, device, ens_weight)
         batch_loss = criterion(logits, batch_y, teacher_logits, classroom, peers, **hp)
         running_loss += batch_loss.item() * batch_size
+        pbar.set_postfix(loss=f'{running_loss / num_total:.4f}')
         batch_loss.backward()
         optim.first_step()
 
@@ -320,7 +323,7 @@ def produce_evaluation_file(
         models: list[nn.Module],
         device: torch.device,
         ens_weight: list,
-        save_path: str,
+        save_path: str | list,
         trial_path: str
 ) -> None:
     for m in models:
@@ -345,7 +348,7 @@ def produce_evaluation_file(
 
             ens_out = torch.einsum('ijk,j->ik', batch_scores, torch.as_tensor(ens_weight, dtype=batch_scores.dtype, device=batch_scores.device)).cpu() # (B, 2)
         fname_list.extend(utt_id)
-        score_list.extend(ens_out.tolist())
+        score_list.extend(ens_out[:, 1].tolist())
 
     assert len(trial_lines) == len(fname_list) == len(score_list)
     with open(save_path, 'w') as fh:
@@ -353,7 +356,7 @@ def produce_evaluation_file(
             _, utt_id, _, src, key = trl.strip().split(' ')
             assert fn == utt_id
             fh.write(f'{utt_id} {src} {key} {sco}\n')
-    print(f'Scores saved to {save_path}')
+    tqdm.write(f'Scores saved to {save_path}')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Adversarial on Distillation Frameworks')
@@ -361,34 +364,37 @@ if __name__ == '__main__':
                         dest='config',
                         type=str,
                         help='configuration file',
-                        required=True)
+                        required=True
+    )
     parser.add_argument('--teacher_config',
                         dest='teacher_config',
                         type=str,
                         help='teacher (AASIST) configuration file',
-                        default='./config/AASIST.conf')
-    parser.add_argument(
-        '--output_dir',
-        dest='output_dir',
-        type=str,
-        help='output directory for results',
-        default='./results'
+                        default='./config/AASIST.conf'
+    )
+    parser.add_argument('--output_dir',
+                        dest='output_dir',
+                        type=str,
+                        help='output directory for results',
+                        default='./results'
     )
     parser.add_argument('--seed',
                         type=int,
                         default=21,
-                        help='random seed (default: 21)')
-    parser.add_argument(
-        '--eval',
-        action='store_true',
-        help='when this flag is given, evaluates given model and exit'
+                        help='random seed (default: 21)'
+    )
+    parser.add_argument('--eval',
+                        action='store_true',
+                        help='when this flag is given, evaluates given model and exit'
     )
     parser.add_argument('--comment',
                         type=str,
                         default=None,
-                        help='comment to describe the saved model')
+                        help='comment to describe the saved model'
+    )
     parser.add_argument('--ens_weight_path',
                         type=str,
                         default=None,
-                        help='directory to the model weight file (can be also given in the config file)')
+                        help='directory to the model weight file (can be also given in the config file)'
+    )
     main(parser.parse_args())
