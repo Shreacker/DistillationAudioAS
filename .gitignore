@@ -6,6 +6,7 @@ __pycache__/
 # Data
 data/
 checkpoints/
+results/
 test.*
 
 # Teacher model
