@@ -103,7 +103,9 @@ def calculate_tDCF_EER(cm_scores_file,
                 f_res.write(
                     f'\tEER {attack_type}\t\t= {_eer:8.9f} % (Equal error rate for {attack_type}\n'
                 )
-        os.system(f"cat {output_file}")
+        ###
+        with open(output_file, "r") as f_res:
+            print(f_res.read())
 
     return eer_cm * 100, min_tDCF
 

@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from torch.nn import functional as F
 from importlib import import_module
 
-from data_utils.ASVspoof2019 import Dataset_ASVspoof2019_train, Dataset_ASVspoof2019_devNeval, genSpoof_list, select_files
+from data_utils.ASVspoof2019 import Dataset_ASVspoof2019_train, Dataset_ASVspoof2019_devNeval, genSpoof_list
 from utils.sam import SAM
 
 def str_to_bool(val):
@@ -40,12 +40,15 @@ def divergence_metric(metric, P, Q, dev_loader, device='cpu'):
 
     total_div, n = 0., 0
     for item in dev_loader:
-        # Check key name
-        X = item['data'].to(device).flatten(1)
-        log_p = F.log_softmax(P(X), dim=1)
-        log_q = F.log_softmax(Q(X), dim=1)
+        ###
+        X = item[0].to(device)
+        p_out, q_out = P(X), Q(X)
+        p_out = p_out[1] if isinstance(p_out, tuple) else p_out
+        q_out = q_out[1] if isinstance(q_out, tuple) else q_out
+        log_p = F.log_softmax(p_out, dim=1)
+        log_q = F.log_softmax(q_out, dim=1)
         div = metric(log_p, log_q)
-        total_div += div.sum().item()
+        total_div += div.item() * X.size(0)
         n += X.size(0)
 
     P.train(p_mode)
@@ -99,49 +102,20 @@ def get_loader(
         "ASVspoof2019_{}_cm_protocols/{}.cm.eval.trl.txt".format(
             track, prefix_2019))
 
-    d_label_trn, file_train, d_attack_trn = genSpoof_list(dir_meta=trn_list_path,
+    d_label_trn, file_train = genSpoof_list(dir_meta=trn_list_path,
                                             is_train=True,
                                             is_eval=False)
     print("no. training files:", len(file_train))
 
-    sub_sets, subset_info = select_files(d_label_trn, d_attack_trn, seed=42, tts_percents=(30, 50, 70))
-
-    train_set_30tts = Dataset_ASVspoof2019_train(list_IDs=sub_sets["tts30_vc70"],
-                                           labels=d_label_trn,
-                                           base_dir=trn_database_path)
-    
-    train_set_50tts = Dataset_ASVspoof2019_train(list_IDs=sub_sets["tts50_vc50"],
-                                           labels=d_label_trn,
-                                           base_dir=trn_database_path)
-    
-    train_set_70tts = Dataset_ASVspoof2019_train(list_IDs=sub_sets["tts70_vc30"],
-                                           labels=d_label_trn,
-                                           base_dir=trn_database_path)
-    
+    train_set = Dataset_ASVspoof2019_train(list_IDs=file_train, labels=d_label_trn, base_dir=trn_database_path)
     gen = torch.Generator()
     gen.manual_seed(seed)
 
-    trn_loader_30tts = DataLoader(train_set_30tts,
-                            batch_size=config["batch_size"],
+    trn_loader = DataLoader(train_set,
+                            batch_size=config['batch_size'],
                             shuffle=True,
                             drop_last=True,
-                            pin_memory=True,
-                            worker_init_fn=seed_worker,
-                            generator=gen)
-    
-    trn_loader_50tts = DataLoader(train_set_50tts,
-                            batch_size=config["batch_size"],
-                            shuffle=True,
-                            drop_last=True,
-                            pin_memory=True,
-                            worker_init_fn=seed_worker,
-                            generator=gen)
-    
-    trn_loader_70tts = DataLoader(train_set_70tts,
-                            batch_size=config["batch_size"],
-                            shuffle=True,
-                            drop_last=True,
-                            pin_memory=True,
+                            pin_memory=torch.cuda.is_available(),
                             worker_init_fn=seed_worker,
                             generator=gen)
 
@@ -156,7 +130,7 @@ def get_loader(
                             batch_size=config["batch_size"],
                             shuffle=False,
                             drop_last=False,
-                            pin_memory=True)
+                            pin_memory=torch.cuda.is_available())
 
     file_eval = genSpoof_list(dir_meta=eval_trial_path,
                               is_train=False,
@@ -167,12 +141,12 @@ def get_loader(
                              batch_size=config["batch_size"],
                              shuffle=False,
                              drop_last=False,
-                             pin_memory=True)
+                             pin_memory=torch.cuda.is_available())
 
-    return trn_loader_30tts, trn_loader_50tts, trn_loader_70tts, dev_loader, eval_loader
+    return trn_loader, dev_loader, eval_loader
 
 def _get_optimizer(model_parameters, optim_config):
-    optimizer_name = optim_config['optimizer']
+    optimizer_name = optim_config['optimizer'].strip().lower()
 
     if optimizer_name == 'sgd':
         optimizer = torch.optim.SGD(model_parameters,
@@ -192,11 +166,12 @@ def _get_optimizer(model_parameters, optim_config):
     elif optimizer_name == 'adamw+sam':
         base_optimizer = torch.optim.AdamW
         optimizer = SAM(model_parameters,
-                        lr=optim_config['base_lr'],
-                        momentum=0.9,
-                        betas=optim_config['betas'],
-                        weight_decay=optim_config['weight_decay'],
-                        amsgrad=str_to_bool(optim_config['amsgrad'])
+                        base_optimizer=base_optimizer,
+                        lr=optim_config.get('base_lr', 1e-4),
+                        rho=optim_config.get('rho', 0.05),
+                        betas=optim_config.get('betas', [0.9, 0.999]),
+                        weight_decay=optim_config.get('weight_decay', 1e-4),
+                        amsgrad=str_to_bool(optim_config.get('amsgrad', 'False'))
                         )
     else:
         print('Un-known optimizer', optimizer_name)
@@ -257,14 +232,15 @@ def GS(
 ):
     student_model.eval()
 
+    current_idx = max(current_idx, 0)
     j = current_idx + 1
     n_anchors = len(teacher_checkpoints)
 
     def anchor2metric(idx):
-        if idx >= 0:
-            anchor = torch.load(teacher_checkpoints[idx], map_location=device, weights_only=True)
-            teacher_model.load_state_dict(anchor)
-        
+        ###
+        anchor = torch.load(teacher_checkpoints[idx], map_location=device, weights_only=True)
+        teacher_model.load_state_dict(anchor)
+
         return divergence_metric(metric, student_model, teacher_model, dev_dl, device=device)
 
     h_i = anchor2metric(current_idx)
@@ -274,5 +250,6 @@ def GS(
         r_ij = (h_j - h_i) / h_i
         if r_ij > threshold:
             return j - 1
+        j += 1
 
     return n_anchors - 1
