@@ -5,43 +5,7 @@ import torch.nn.functional as F
 import fastcore.all as fc
 import warnings
 
-class DilatedDSConv(nn.Module):
-    def __init__(
-            self,
-            in_channels,
-            out_channels,
-            kernel_size,
-            dilation
-    ):
-        super().__init__()
-        padding = dilation * (kernel_size - 1) // 2
-
-        self.depthwise = nn.Conv2d(
-            in_channels,
-            in_channels,
-            kernel_size=kernel_size,
-            padding=padding,
-            dilation=dilation,
-            groups=in_channels,
-            bias=False
-        )
-
-        self.pointwise = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=1,
-            bias=False
-        )
-
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        x = self.relu(self.bn(x))
-
-        return x
+from models.encoder import Encoder, DilatedDSConv
 
 class ECA(nn.Module):
     def __init__(
@@ -163,14 +127,21 @@ class Student(nn.Module):
         super().__init__()
 
         self.d_args = d_args
-        in_channels = 1
+        enc_filts = d_args.get('enc_filts', [70, [1, 32], [32, 64], [64, 64]])
+        self.encoder = Encoder(
+            kernel_size=d_args.get('enc_kernel_size', 129),
+            filts=enc_filts,
+            Ds=d_args.get('enc_Ds', [[1, 2], [2, 4], [4, 4]])
+        )
+        in_channels = enc_filts[-1][1]
         out_channels = d_args['out_channels']
         B = d_args['B']
-        Rs = d_args['Rs']
-        Ks = d_args['Ks']
-        Ds = d_args['Ds']
-        eca_kernel_size = d_args['eca_kernel_size']
-        tempo_gate_kernel_size = d_args['tempo_gate_kernel_size']
+        if B != 0:
+            Rs = d_args['Rs']
+            Ks = d_args['Ks']
+            Ds = d_args['Ds']
+            eca_kernel_size = d_args['eca_kernel_size']
+            tempo_gate_kernel_size = d_args['tempo_gate_kernel_size']
 
         self.blocks = nn.Sequential()
         for i in range(B):
@@ -186,11 +157,10 @@ class Student(nn.Module):
             in_channels = out_channels
 
         self.avg_pooling = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(nn.Linear(out_channels, 512), nn.ReLU(), nn.Linear(512, 2))
+        self.fc = nn.Sequential(nn.Linear(in_channels, 512), nn.ReLU(), nn.Linear(512, 2))
 
     def forward(self, x: torch.Tensor):
-        if x.dim() == 3: x = x.unsqueeze(1)
-        # Encoder
+        x = self.encoder(x)
         feat = self.blocks(x) # (B, C, M, N)
         feat = self.avg_pooling(feat).flatten(1) # (B, CxMxN)
         logits = self.fc(feat) # (B, 2)

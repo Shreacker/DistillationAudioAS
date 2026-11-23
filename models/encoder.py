@@ -6,8 +6,45 @@ import torch.nn as nn
 import torch.nn.functional as F
 import fastcore.all as fc
 import warnings
-from student import DilatedDSConv
-    
+
+class DilatedDSConv(nn.Module):
+    def __init__(
+            self,
+            in_channels,
+            out_channels,
+            kernel_size,
+            dilation
+    ):
+        super().__init__()
+        padding = dilation * (kernel_size - 1) // 2
+
+        self.depthwise = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+            groups=in_channels,
+            bias=False
+        )
+
+        self.pointwise = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            bias=False
+        )
+
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = self.relu(self.bn(x))
+
+        return x
+
 class SincConv(nn.Module):
     @staticmethod
     def to_mel(hz):
