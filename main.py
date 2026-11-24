@@ -18,8 +18,7 @@ from natsort import natsorted
 from utils.loss_fn import ClassroomCache, ClassroomLoss
 from utils.ga import EnsembleWeightGA
 from utils.evaluation import calculate_tDCF_EER
-from utils.utilities import str_to_bool, set_seed, get_model, get_loader, create_optimizer, GS
-from models.student import Student
+from utils.utilities import str_to_bool, set_seed, get_model, get_loader, create_optimizer, GS, collect_log_probs, cache_anchor_log_probs, anchor_cache_path, load_anchor_cache
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -43,6 +42,7 @@ def main(args: argparse.Namespace) -> None:
         optim_config[s] = config[s]['optim_config']
         optim_config[s]['epochs'] = config['num_epochs']
 
+    seed = args.seed
     set_seed(args.seed)
 
     output_dir = Path(args.output_dir)
@@ -81,11 +81,12 @@ def main(args: argparse.Namespace) -> None:
     assert len(teacher_chkps) > 0, "No teacher checkpoints found."
 
     print(f'Device: {device}')
+    print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')
 
     # Models and DataLoaders
-    print('--Teacher params count:')
+    print('--Teacher params count--')
     teacher = get_model(teacher_config['model_config'], 'Teacher', device)
-    print('--Students params count:')
+    print('--Students params count--')
     students = [get_model(model_config[s], 'Student', device) for s in model_config.keys()]
     train_dl, dev_dl, eval_dl = get_loader(
         database_path, args.seed, config
@@ -130,10 +131,19 @@ def main(args: argparse.Namespace) -> None:
     metric_path = model_tag / 'metrics'
     os.makedirs(metric_path, exist_ok=True)
 
-    val_dl = DataLoader(Subset(train_dl.dataset, range(1000)), batch_size=train_dl.batch_size, shuffle=False)
+    ###
+    val_idx = torch.randperm(len(dev_dl.dataset), generator=torch.Generator().manual_seed(args.seed))[:1000].tolist()
+    val_dl = DataLoader(Subset(dev_dl.dataset, val_idx), batch_size=dev_dl.batch_size, shuffle=False)
     current_index = -1
-    threshold = config['teacher'].get('threshold', 1.0)
-    divergence_metric = nn.KLDivLoss(reduction='batchmean', log_target=True)
+    threshold = config['teacher'].get('threshold', 0.8)
+    ###
+    anchor_cache = args.teacher_anchor_cache or anchor_cache_path(seed, len(val_idx), teacher_chkps)
+    if os.path.isfile(anchor_cache):
+        anchor_log_p = load_anchor_cache(anchor_cache, val_idx, teacher_chkps)
+        tqdm.write(f'Loaded teacher anchor cache: {anchor_cache}')
+    else:
+        anchor_log_p = cache_anchor_log_probs(teacher, teacher_chkps, val_dl, anchor_cache, seed, val_idx, device)
+        tqdm.write(f'Saved teacher anchor cache: {anchor_cache}')
 
     criterion = ClassroomLoss(weight=torch.tensor([0.1, 0.9])).to(device)
     cache = ClassroomCache(len(students), len(train_dl.dataset), n_classes=2)
@@ -146,12 +156,15 @@ def main(args: argparse.Namespace) -> None:
     for epoch in tqdm(range(config['num_epochs']), desc='Epoch', leave=True, position=0):
         tqdm.write(f'Start training epoch {epoch:03d}')
         if current_index < len(teacher_chkps) - 1:
-            current_index = min(
-                GS(s, teacher, teacher_chkps, current_index, val_dl, threshold, divergence_metric, device=device)
-                for s in students
+            ###
+            new_index = min(
+                GS(collect_log_probs(s, val_dl, device, desc=f'Collect student {k+1}\'s cache'), anchor_log_p, current_index, threshold, desc=f'GS Student {k+1}: ')
+                for k, s in enumerate(students)
             )
-            teacher.load_state_dict(torch.load(teacher_chkps[current_index], map_location=device))
-            teacher.eval()
+            if new_index != current_index:
+                current_index = new_index
+                teacher.load_state_dict(torch.load(teacher_chkps[current_index], map_location=device))
+                teacher.eval()
         
         tqdm.write(f'Teacher checkpoint index: {current_index}')
         phase = min(n_phase - 1, current_index * n_phase // len(teacher_chkps))
@@ -371,6 +384,12 @@ if __name__ == '__main__':
                         type=str,
                         help='teacher (AASIST) configuration file',
                         default='./config/AASIST.conf'
+    )
+    parser.add_argument('--teacher_anchor_cache',
+                        dest='teacher_anchor_cache',
+                        type=str,
+                        help='anchor cache of teacher on a subset of developing dataloader',
+                        default=None
     )
     parser.add_argument('--output_dir',
                         dest='output_dir',
