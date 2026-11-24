@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.nn import functional as F
 from importlib import import_module
+from tqdm import tqdm
 
 from data_utils.ASVspoof2019 import Dataset_ASVspoof2019_train, Dataset_ASVspoof2019_devNeval, genSpoof_list
 from utils.sam import SAM
@@ -32,28 +33,49 @@ def js_div(log_p, log_q):
     
     return 0.5 * kl_div(log_p, log_m) + 0.5 * kl_div(log_q, log_m)
 
+###
 @torch.no_grad()
-def divergence_metric(metric, P, Q, dev_loader, device='cpu'):
-    p_mode, q_mode = P.training, Q.training
-    P.eval()
-    Q.eval()
+def collect_log_probs(model, dl, device='cpu', desc=None):
+    mode = model.training
+    model.eval()
+    out = []
+    for item in tqdm(dl, desc=desc, leave=False, disable=desc is None):
+        o = model(item[0].to(device))
+        o = o[1] if isinstance(o, tuple) else o
+        out.append(F.log_softmax(o, dim=-1).cpu())
+    model.train(mode)
 
-    total_div, n = 0., 0
-    for item in dev_loader:
-        ###
-        X = item[0].to(device)
-        p_out, q_out = P(X), Q(X)
-        p_out = p_out[1] if isinstance(p_out, tuple) else p_out
-        q_out = q_out[1] if isinstance(q_out, tuple) else q_out
-        log_p = F.log_softmax(p_out, dim=1)
-        log_q = F.log_softmax(q_out, dim=1)
-        div = metric(log_p, log_q)
-        total_div += div.item() * X.size(0)
-        n += X.size(0)
+    return torch.cat(out)
 
-    P.train(p_mode)
-    Q.train(q_mode)
-    return total_div / n
+###
+def anchor_cache_path(seed, n_val, teacher_checkpoints, root='./models/checkpoints/teacher_anchor_cache'):
+    return os.path.join(root, f'seed{seed}_n{n_val}_A{len(teacher_checkpoints)}.pth')
+
+###
+def cache_anchor_log_probs(teacher_model, teacher_checkpoints, dl, save_path, seed, val_idx, device='cpu'):
+    res = []
+    for k, c in enumerate(tqdm(teacher_checkpoints, desc='Caching teacher anchors', leave=False)):
+        teacher_model.load_state_dict(torch.load(c, map_location=device, weights_only=True))
+        res.append(collect_log_probs(teacher_model, dl, device, desc=f'Anchor C_{k}'))
+    log_p = torch.stack(res)
+
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+    torch.save({
+        'log_p': log_p,
+        'seed': seed,
+        'val_idx': list(val_idx),
+        'chkps': [os.path.basename(c) for c in teacher_checkpoints]
+    }, save_path)
+
+    return log_p
+
+###
+def load_anchor_cache(path, val_idx, teacher_checkpoints):
+    d = torch.load(path, map_location='cpu')
+    assert d['val_idx'] == list(val_idx), f'Anchor cache {path} was built on a different validation subset (seed {d["seed"]}).'
+    assert d['chkps'] == [os.path.basename(c) for c in teacher_checkpoints], f'Anchor cache {path} was built on different teacher checkpoints.'
+
+    return d['log_p']
 
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
@@ -180,6 +202,7 @@ def _get_optimizer(model_parameters, optim_config):
     return optimizer
 
 def _get_scheduler(optimizer, optim_config):
+    optimizer = getattr(optimizer, 'base_optimizer', optimizer)
     if optim_config['scheduler'] == 'multistep':
         scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer,
@@ -219,37 +242,26 @@ def create_optimizer(model_parameters, optim_config):
     
     return optimizer, scheduler
 
+###
 def GS(
-        student_model: torch.nn.Module,
-        teacher_model: torch.nn.Module,
-        teacher_checkpoints: list,
+        student_log_p: torch.Tensor,
+        anchor_log_p: torch.Tensor,
         current_idx: int=-1,
-        dev_dl: DataLoader=None,
         threshold: float=0.8,
-        metric=None,
         eps: float=1e-12,
-        device='cpu'
+        desc: str=None,
 ):
-    student_model.eval()
+    kl = (anchor_log_p.exp() * (anchor_log_p - student_log_p.unsqueeze(0))).sum(-1).mean(-1)
+    n_anchors = kl.size(0)
 
     current_idx = max(current_idx, 0)
-    j = current_idx + 1
-    n_anchors = len(teacher_checkpoints)
+    h_i = kl[current_idx].clamp_min(eps)
 
-    def anchor2metric(idx):
-        ###
-        anchor = torch.load(teacher_checkpoints[idx], map_location=device, weights_only=True)
-        teacher_model.load_state_dict(anchor)
+    for j in range(current_idx + 1, n_anchors):
+        r_ij = (kl[j] - h_i) / h_i
 
-        return divergence_metric(metric, student_model, teacher_model, dev_dl, device=device)
-
-    h_i = anchor2metric(current_idx)
-
-    while j < n_anchors:
-        h_j = anchor2metric(j)
-        r_ij = (h_j - h_i) / h_i
         if r_ij > threshold:
+            tqdm.write(desc + f'At j={j}, r_ij={float(r_ij):.3f} > thr={threshold}')
             return j - 1
-        j += 1
 
     return n_anchors - 1
