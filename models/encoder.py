@@ -202,7 +202,7 @@ class Encoder(nn.Module):
         x = x.unsqueeze(1)
         x = self.sincConv(x, mask=Freq_aug)
         x = x.unsqueeze(dim=1)
-        x = F.avg_pool2d(torch.abs(x), kernel_size=(3,3), ceil_mode=True) # filter=3, stride=3
+        x = F.avg_pool2d(torch.abs(x), kernel_size=(3,12), ceil_mode=True)
         x = self.bn1(x)
         x = self.selu(x)
         x = self.encoder(x)
